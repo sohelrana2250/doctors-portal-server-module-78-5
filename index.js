@@ -4,7 +4,9 @@ const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const jwt = require("jsonwebtoken");
 const nodemailer = require("nodemailer");
 const mg = require("nodemailer-mailgun-transport");
+const corn = require("node-cron");
 const httpStatus = require("http-status");
+const { v4: uuidv4 } = require("uuid");
 const {
   specific_data,
   update_data,
@@ -12,6 +14,9 @@ const {
   delete_data,
 } = require("./reuseable_method/reuseable_function");
 const { TCategorie } = require("./utilites/T_Categorie");
+const { verifyJWT } = require("./auth/middlewere");
+const { sendEmail } = require("./auth/sendEmail");
+const { createDoctorContent } = require("./auth/emaildata");
 require("dotenv").config();
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 
@@ -79,23 +84,6 @@ const client = new MongoClient(uri, {
     });
 }*/
 
-function verifyJWT(req, res, next) {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) {
-    return res.status(401).send("unauthorized access");
-  }
-
-  const token = authHeader.split(" ")[1];
-
-  jwt.verify(token, process.env.ACCESS_TOKEN, function (err, decoded) {
-    if (err) {
-      return res.status(403).send({ message: "forbidden access" });
-    }
-    req.decoded = decoded;
-    next();
-  });
-}
-
 async function run() {
   try {
     const appointmentOptionCollection = client
@@ -109,7 +97,14 @@ async function run() {
     const paymentsCollection = client
       .db("doctorsPortal")
       .collection("payments");
-
+    const patientCollection = client.db("doctorsPortal").collection("patient");
+    const prescriptionCollection = client
+      .db("doctorsPortal")
+      .collection("prescription");
+    const reviewCollection = client.db("doctorsPortal").collection("reviews");
+    const onsiteBookingCollection = client
+      .db("doctorsPortal")
+      .collection("onsitebookings");
     // NOTE: make sure you use verifyAdmin after verifyJWT
     const verifyAdmin = async (req, res, next) => {
       const decodedEmail = req.decoded.email;
@@ -121,32 +116,166 @@ async function run() {
       }
       next();
     };
+    const verifyDoctor = async (req, res, next) => {
+      const decodedEmail = req.decoded.email;
 
-    // Use Aggregate to query multiple collection and then merge data
-    app.get("/appointmentOptions", async (req, res) => {
-      const date = req.query.date;
-      const query = {};
-      const options = await appointmentOptionCollection.find(query).toArray();
+      const isItDoctor = await usersCollection.findOne({ email: decodedEmail });
+      if (isItDoctor?.role !== "doctor") {
+        return res.status(403).send({ message: "forbidden access" });
+      }
+      next();
+    };
 
-      // get the bookings of the provided date
-      const bookingQuery = { appointmentDate: date };
-      const alreadyBooked = await bookingsCollection
-        .find(bookingQuery)
+    OnsiteUnpaidListOfAppointment = async () => {
+      const thirtyMinAgo = new Date(Date.now() - 30 * 60 * 1000);
+
+      const unPaidAppointments = await onsiteBookingCollection
+        .find({
+          bookingTime: { $lte: thirtyMinAgo },
+          paid: false,
+        })
+        .project({ _id: 1 })
         .toArray();
 
-      // code carefully :D
-      options.forEach((option) => {
-        const optionBooked = alreadyBooked.filter(
-          (book) => book.treatment === option.name
+      const idsToUpdate = unPaidAppointments.map(
+        (appointment) => appointment._id
+      );
+
+      if (idsToUpdate.length > 0) {
+        await onsiteBookingCollection.updateMany(
+          {
+            _id: { $in: idsToUpdate },
+          },
+          { $set: { isBooked: false } },
+          { upsert: true }
         );
-        const bookedSlots = optionBooked.map((book) => book.slot);
-        const remainingSlots = option.slots.filter(
-          (slot) => !bookedSlots.includes(slot)
-        );
-        option.slots = remainingSlots;
+      }
+    };
+
+    const ExprireBookingDateOnsiteAppointment = async () => {
+      const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+      const expireBooking = await onsiteBookingCollection
+        .find({
+          createdAt: { $lte: twentyFourHoursAgo },
+        })
+        .project({
+          _id: 1,
+        })
+        .toArray();
+
+      // delete  booking sloat after 24  hours deaily
+      const idsToDelete = expireBooking.map((appointment) => appointment._id);
+      await onsiteBookingCollection.deleteMany({
+        _id: { $in: idsToDelete },
       });
-      res.send(options);
+    };
+
+    const CancleUnpaidAppointments = async () => {
+      const thirtyMinAgo = new Date(Date.now() - 30 * 60 * 1000);
+
+      const unPaidAppointments = await bookingsCollection
+        .find({
+          bookingTime: { $lte: thirtyMinAgo },
+          paid: false,
+        })
+        .project({ _id: 1 })
+        .toArray();
+
+      const idsToUpdate = unPaidAppointments.map(
+        (appointment) => appointment._id
+      );
+
+      if (idsToUpdate.length > 0) {
+        await bookingsCollection.updateMany(
+          {
+            _id: { $in: idsToUpdate },
+          },
+          { $set: { isBooked: false } },
+          { upsert: true }
+        );
+      }
+    };
+
+    const CancelExprireBookingDate = async () => {
+      const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+      const expireBooking = await bookingsCollection
+        .find({
+          createdAt: { $lte: twentyFourHoursAgo },
+        })
+        .project({
+          _id: 1,
+        })
+        .toArray();
+
+      // delete  booking sloat after 24  hours deaily
+      const idsToDelete = expireBooking.map((appointment) => appointment._id);
+      await bookingsCollection.deleteMany({
+        _id: { $in: idsToDelete },
+      });
+    };
+
+    // online payment system
+
+    corn.schedule("* * * * *", () => {
+      try {
+        CancleUnpaidAppointments().catch(console.error);
+      } catch (error) {
+        console.log(error);
+      }
     });
+    // "0 0 * * *"
+    corn.schedule("* * * * *", () => {
+      try {
+        CancelExprireBookingDate().catch(console.error);
+      } catch (error) {
+        console.log(error);
+      }
+    });
+    // onsite payment getway
+    corn.schedule("* * * * *", () => {
+      try {
+        OnsiteUnpaidListOfAppointment().catch(console.error);
+      } catch (error) {
+        console.log(error);
+      }
+    });
+
+    corn.schedule("* * * * *", () => {
+      try {
+        ExprireBookingDateOnsiteAppointment().catch(console.error);
+      } catch (error) {
+        console.log(error);
+      }
+    });
+    app.get(
+      "/appointmentOptions",
+
+      async (req, res) => {
+        const date = req.query.date;
+        const query = {};
+        const options = await appointmentOptionCollection.find(query).toArray();
+
+        // get the bookings of the provided date
+        const bookingQuery = { appointmentDate: date };
+        const alreadyBooked = await bookingsCollection
+          .find(bookingQuery)
+          .toArray();
+
+        // code carefully :D
+        options.forEach((option) => {
+          const optionBooked = alreadyBooked.filter(
+            (book) => book.treatment === option.name
+          );
+          const bookedSlots = optionBooked.map((book) => book.slot);
+          const remainingSlots = option.slots.filter(
+            (slot) => !bookedSlots.includes(slot)
+          );
+          option.slots = remainingSlots;
+        });
+
+        res.send(options);
+      }
+    );
 
     app.get("/post", async (req, res) => {
       const result = await appointmentOptionCollection.insertOne({
@@ -155,54 +284,72 @@ async function run() {
       res.send(result);
     });
 
-    app.get("/v2/appointmentOptions", async (req, res) => {
-      const date = req.query.date;
-      const options = await appointmentOptionCollection
-        .aggregate([
-          {
-            $lookup: {
-              from: "bookings",
-              localField: "name",
-              foreignField: "treatment",
-              pipeline: [
-                {
-                  $match: {
-                    $expr: {
-                      $eq: ["$appointmentDate", date],
+    app.get(
+      "/v2/appointmentOptions",
+      verifyJWT,
+      verifyDoctor,
+      async (req, res) => {
+        const date = req.query.date;
+        const email = req.decoded.email; // Extract email from request body
+
+        try {
+          const options = await appointmentOptionCollection
+            .aggregate([
+              {
+                $lookup: {
+                  from: "bookings",
+                  localField: "name",
+                  foreignField: "treatment",
+                  pipeline: [
+                    {
+                      $match: {
+                        $expr: {
+                          $and: [
+                            { $eq: ["$appointmentDate", date] },
+                            { $eq: ["$email", email] },
+                          ],
+                        },
+                      },
+                    },
+                  ],
+                  as: "booked",
+                },
+              },
+              {
+                $project: {
+                  name: 1,
+                  price: 1,
+                  slots: 1,
+                  booked: {
+                    $map: {
+                      input: "$booked",
+                      as: "book",
+                      in: "$$book.slot",
                     },
                   },
                 },
-              ],
-              as: "booked",
-            },
-          },
-          {
-            $project: {
-              name: 1,
-              price: 1,
-              slots: 1,
-              booked: {
-                $map: {
-                  input: "$booked",
-                  as: "book",
-                  in: "$$book.slot",
+              },
+              {
+                $project: {
+                  name: 1,
+                  price: 1,
+                  slots: {
+                    $setDifference: ["$slots", "$booked"],
+                  },
                 },
               },
-            },
-          },
-          {
-            $project: {
-              name: 1,
-              price: 1,
-              slots: {
-                $setDifference: ["$slots", "$booked"],
-              },
-            },
-          },
-        ])
-        .toArray();
-      res.send(options);
-    });
+            ])
+            .toArray();
+
+          res.send(options);
+        } catch (err) {
+          console.error(err);
+          res
+            .status(500)
+            .send("An error occurred while fetching appointment options.");
+        }
+      }
+    );
 
     app.get("/appointmentSpecialty", async (req, res) => {
       const query = {};
@@ -229,35 +376,130 @@ async function run() {
 
       const query = { email: email };
       const bookings = await bookingsCollection.find(query).toArray();
-      res.send(bookings);
+      res.send({
+        status: httpStatus.OK,
+        message: "Successfully Get the Data",
+        data: bookings,
+      });
     });
 
     app.get("/bookings/:id", async (req, res) => {
       const id = req.params.id;
-      const query = { _id: ObjectId(id) };
-      const booking = await bookingsCollection.findOne(query);
-      res.send(booking);
+      // console.log(`Received ID: ${id}`);
+
+      if (!ObjectId.isValid(id)) {
+        return res.status(httpStatus.NOT_FOUND).send({
+          success: false,
+          message: "Invalid ID format",
+          status: httpStatus.NOT_FOUND,
+        });
+      }
+
+      try {
+        const query = { _id: new ObjectId(id) };
+        const booking = await bookingsCollection.findOne(query);
+
+        if (booking) {
+          return res.send(booking);
+        }
+
+        // If no booking found in bookingsCollection, check onsiteBookingCollection
+        const onsiteBooking = await onsiteBookingCollection.findOne(query);
+        if (onsiteBooking) {
+          return res.send(onsiteBooking);
+        }
+
+        // If no booking found in either collection
+        return res.status(httpStatus.NOT_FOUND).send({
+          success: false,
+          message: "Booking not found",
+          status: httpStatus.NOT_FOUND,
+        });
+      } catch (error) {
+        console.error("Error fetching booking:", error);
+        return res.status(httpStatus.SERVICE_UNAVAILABLE).send({
+          success: false,
+          message: error.message,
+          status: httpStatus.SERVICE_UNAVAILABLE,
+        });
+      }
     });
 
     app.post("/bookings", async (req, res) => {
       const booking = req.body;
+
       const query = {
         appointmentDate: booking.appointmentDate,
+        slot: booking.slot,
         email: booking.email,
         treatment: booking.treatment,
       };
+      switch (booking.condition) {
+        case process.env.ONLINE_BOOKING:
+          {
+            Reflect.deleteProperty(booking, "condition");
+            const isExistDoctorId = await doctorsCollection
+              .findOne({
+                email: booking.email,
+              })
+              .then((data) => data._id);
+            const doctorSloatBooking = {
+              doctorId: isExistDoctorId,
+              videoCallingId: uuidv4(),
+              status: "INPROGRESS",
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            };
+            const alreadyBooked = await bookingsCollection
+              .find(query)
+              .toArray();
+            if (alreadyBooked.length) {
+              const message = `You already have a booking on ${booking.appointmentDate}`;
+              return res.send({ acknowledged: false, message });
+            }
+            const result = await bookingsCollection.insertOne({
+              ...booking,
+              ...doctorSloatBooking,
+            });
 
-      const alreadyBooked = await bookingsCollection.find(query).toArray();
-
-      if (alreadyBooked.length) {
-        const message = `You already have a booking on ${booking.appointmentDate}`;
-        return res.send({ acknowledged: false, message });
+            res.send(result);
+          }
+          break;
+        case process.env.ONSITE_BOOKING:
+          {
+            const isExistDoctorId = await doctorsCollection
+              .findOne({
+                email: booking.email,
+              })
+              .then((data) => data._id);
+            const doctorSloatBooking = {
+              doctorId: isExistDoctorId,
+              status: "INPROGRESS",
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            };
+            //checked alredy booked or Not
+            const alreadyBooked = await onsiteBookingCollection
+              .find(query)
+              .toArray();
+            if (alreadyBooked.length) {
+              const message = `You already have a booking on ${booking.appointmentDate}`;
+              return res.send({ acknowledged: false, message });
+            }
+            const result = await onsiteBookingCollection.insertOne({
+              ...booking,
+              ...doctorSloatBooking,
+            });
+            res.send(result);
+          }
+          break;
+        default: {
+          res.send({
+            status: httpStatus.UPGRADE_REQUIRED,
+            message: "Onsite And Online Both Request is Faileds",
+          });
+        }
       }
-
-      const result = await bookingsCollection.insertOne(booking);
-      //booking implement upcomming days
-      //sendBookingEmail(booking)
-      res.send(result);
     });
 
     app.post("/create-payment-intent", async (req, res) => {
@@ -275,22 +517,87 @@ async function run() {
       });
     });
 
-    app.post("/payments", async (req, res) => {
+    app.post("/payments", verifyJWT, async (req, res) => {
       const payment = req.body;
-      const result = await paymentsCollection.insertOne(payment);
-      const id = payment.bookingId;
-      const filter = { _id: ObjectId(id) };
-      const updatedDoc = {
-        $set: {
-          paid: true,
-          transactionId: payment.transactionId,
-        },
-      };
-      const updatedResult = await bookingsCollection.updateOne(
-        filter,
-        updatedDoc
-      );
-      res.send(result);
+
+      if (payment.condition === process.env.CONDITION) {
+        const session = client.startSession();
+        try {
+          session.startTransaction();
+
+          const id = payment.bookingId;
+          const filter = { _id: ObjectId(id) };
+          Reflect.deleteProperty(payment, "bookingId");
+          const updatedDoc = {
+            $set: {
+              paid: true,
+              transactionId: payment.transactionId,
+              status: "COMPLETED",
+            },
+          };
+          const updatedResult = await onsiteBookingCollection.updateOne(
+            filter,
+            updatedDoc,
+            { upsert: true, session }
+          );
+          if (!updatedResult) {
+            throw new Error("Payment Booking Collection Session Failed");
+          }
+
+          const paymentSection = await paymentsCollection.insertOne(payment, {
+            session,
+          });
+          if (!paymentSection) {
+            throw new Error("Payment Transaction  Session is Faileds");
+          }
+
+          await session.commitTransaction();
+          await session.endSession();
+          return res.send(paymentSection);
+        } catch (error) {
+          await session.abortTransaction();
+          await session.endSession();
+        }
+      }
+
+      // started transaction rollbacked
+      const session = client.startSession();
+      try {
+        session.startTransaction();
+
+        const id = payment.bookingId;
+        const filter = { _id: ObjectId(id) };
+        Reflect.deleteProperty(payment, "bookingId");
+        const updatedDoc = {
+          $set: {
+            paid: true,
+            transactionId: payment.transactionId,
+            status: "COMPLETED",
+          },
+        };
+        const updatedResult = await bookingsCollection.updateOne(
+          filter,
+          updatedDoc,
+          { upsert: true, session }
+        );
+        if (!updatedResult) {
+          throw new Error("Payment Booking Collection Session Failed");
+        }
+
+        const paymentSection = await paymentsCollection.insertOne(payment, {
+          session,
+        });
+        if (!paymentSection) {
+          throw new Error("Payment Transaction  Session is Faileds");
+        }
+
+        await session.commitTransaction();
+        await session.endSession();
+        return res.send(paymentSection);
+      } catch (error) {
+        await session.abortTransaction();
+        await session.endSession();
+      }
     });
 
     app.get("/jwt", async (req, res) => {
@@ -299,7 +606,7 @@ async function run() {
       const user = await usersCollection.findOne(query);
       if (user) {
         const token = jwt.sign({ email }, process.env.ACCESS_TOKEN, {
-          expiresIn: "1d",
+          expiresIn: "7d",
         });
         return res.send({ accessToken: token });
       }
@@ -321,9 +628,7 @@ async function run() {
 
     app.post("/users", async (req, res) => {
       const user = req.body;
-      console.log(user);
-      // TODO: make sure you do not enter duplicate user email
-      // only insert users if the user doesn't exist in the database
+
       const result = await usersCollection.insertOne(user);
       res.send(result);
     });
@@ -345,19 +650,6 @@ async function run() {
       res.send(result);
     });
 
-    // temporary to update price field on appointment options
-    // app.get('/addPrice', async (req, res) => {
-    //     const filter = {}
-    //     const options = { upsert: true }
-    //     const updatedDoc = {
-    //         $set: {
-    //             price: 99
-    //         }
-    //     }
-    //     const result = await appointmentOptionCollection.updateMany(filter, updatedDoc, options);
-    //     res.send(result);
-    // })
-
     app.get("/doctors", verifyJWT, verifyAdmin, async (req, res) => {
       const query = {};
       const doctors = await doctorsCollection.find(query).toArray();
@@ -371,6 +663,23 @@ async function run() {
         session.startTransaction();
         const doctor = req.body;
         const createdBy = req.decoded.email;
+        const sendemail = createDoctorContent({
+          email: doctor.email,
+          password: doctor.password,
+        });
+
+        const info = await sendEmail(
+          doctor.email,
+          sendemail.email_body,
+          sendemail.subject
+        );
+
+        if (!info.messageId) {
+          return res.send({
+            status: httpStatus.NOT_FOUND,
+            message: error?.message,
+          });
+        }
         const result = await doctorsCollection.insertOne(
           {
             createdBy,
@@ -404,33 +713,28 @@ async function run() {
       }
     });
 
-    app.get(
-      "/specific/doctors/:id",
-      verifyJWT,
-      verifyAdmin,
-      async (req, res) => {
-        const { id } = req.params;
-        const query = {
-          _id: new ObjectId(`${id}`),
-        };
-        specific_data(doctorsCollection, query)
-          .then((result) => {
-            return res.status(httpStatus.OK).send({
-              status: httpStatus.OK,
-              message: "Successfuly Get Specific Data",
-              success: true,
-              data: result,
-            });
-          })
-          .catch((error) => {
-            return res.status(httpStatus.INTERNAL_SERVER_ERROR).send({
-              success: false,
-              message: error?.message,
-              status: httpStatus.INTERNAL_SERVER_ERROR,
-            });
+    app.get("/specific/doctors/:id", verifyJWT, async (req, res) => {
+      const { id } = req.params;
+      const query = {
+        _id: new ObjectId(`${id}`),
+      };
+      specific_data(doctorsCollection, query)
+        .then((result) => {
+          return res.status(httpStatus.OK).send({
+            status: httpStatus.OK,
+            message: "Successfuly Get Specific Data",
+            success: true,
+            data: result,
           });
-      }
-    );
+        })
+        .catch((error) => {
+          return res.status(httpStatus.INTERNAL_SERVER_ERROR).send({
+            success: false,
+            message: error?.message,
+            status: httpStatus.INTERNAL_SERVER_ERROR,
+          });
+        });
+    });
     app.patch(
       "/update/doctor/:id",
       verifyJWT,
@@ -452,6 +756,8 @@ async function run() {
             appointmentfee: data.appointmentfee,
             currentWorkingPlace: data.currentWorkingPlace,
             designation: data.designation,
+            district: data.district,
+            chamber: data.chamber,
           },
         };
         update_data(filter, updateDoc, doctorsCollection)
@@ -621,6 +927,883 @@ async function run() {
           });
       }
     );
+    app.get("/doctor/myprofile", verifyJWT, verifyDoctor, async (req, res) => {
+      const query = {
+        email: req.decoded.email,
+      };
+      specific_data(doctorsCollection, query)
+        .then((result) => {
+          return res.send({
+            status: httpStatus.OK,
+            message: "Successfully Get",
+            data: result,
+          });
+        })
+        .catch((error) => {
+          return res.send({
+            status: httpStatus.NOT_FOUND,
+            message: error?.message,
+          });
+        });
+    });
+    app.put(
+      "/doctor/update/profile/:id",
+      verifyJWT,
+      verifyDoctor,
+      async (req, res) => {
+        const filter = { _id: new ObjectId(`${req.params.id}`) };
+        const { name, specialty, currentWorkingPlace, appointmentfee, image } =
+          req.body;
+        const updateDoc = {
+          $set: {
+            name,
+            specialty,
+            currentWorkingPlace,
+            appointmentfee,
+            image,
+          },
+        };
+        update_data(filter, updateDoc, doctorsCollection)
+          .then((result) => {
+            return res.send({
+              status: httpStatus.OK,
+              message: "Profile Successfully Updated",
+              data: result,
+            });
+          })
+          .catch((error) => {
+            return res.send({
+              status: httpStatus.NOT_FOUND,
+              message: error?.message,
+            });
+          });
+      }
+    );
+    // start patient Appointment
+    app.get("/patient/bookingSloat", async (req, res) => {
+      const pipeline = [
+        {
+          $lookup: {
+            from: "bookings", // the collection to join
+            localField: "_id", // field from doctorCollection
+            foreignField: "doctorId", // field from bookingCollection
+            as: "bookings", // output array field
+          },
+        },
+
+        {
+          $project: {
+            name: 1,
+            specialty: 1,
+            experience: 1,
+            appointmentfee: 1,
+            image: 1,
+            bookings: {
+              appointmentDate: 1,
+              treatment: 1,
+              patient: 1,
+              slot: 1,
+              price: 1,
+              status: 1,
+              doctorId: 1,
+              createdAt: 1,
+              isBooked: 1,
+              _id: 1,
+            },
+          },
+        },
+      ];
+      const mergedData = await doctorsCollection.aggregate(pipeline).toArray();
+      res.send(mergedData);
+    });
+    app.post("/patient/createpatient", verifyJWT, async (req, res) => {
+      const data = req.body;
+      const email = req.decoded.email;
+      const result = await patientCollection.insertOne({ ...data, email });
+      res.send({
+        status: httpStatus.CREATED,
+        message: "Successfully  Recored",
+        data: result,
+      });
+    });
+    app.get("/patient/doctorAppointment", async (req, res) => {
+      const query = {};
+      const result = await doctorsCollection.find(query).toArray();
+      res.send(result);
+    });
+    // my profile
+    app.get("/api/v1/my_profile", verifyJWT, async (req, res) => {
+      const email = req.decoded.email;
+      const isUserRole = await usersCollection.findOne(
+        { email },
+        {
+          projection: {
+            role: 1,
+          },
+        }
+      );
+      if (isUserRole?.role === "user") {
+        const result = await patientCollection.findOne({ email });
+
+        return res.send({
+          status: httpStatus.OK,
+          message: "Successfully Get My Profile",
+          data: result,
+        });
+      } else {
+        const result = await patientCollection.find({}).toArray();
+        return res.send({
+          status: httpStatus.OK,
+          message: "Successfully Get My Profile",
+          data: result,
+        });
+      }
+    });
+    app.put("/api/v1/isBookingSloat/:id", verifyJWT, async (req, res) => {
+      const email = req.decoded.email;
+      const { id } = req.params;
+      const data = req.body;
+
+      const filter = {
+        _id: new ObjectId(id),
+      };
+      const updateDoc = {
+        $set: {
+          isBooked: data.isBooked,
+          patientEmail: email,
+          bookingTime: new Date(),
+        },
+      };
+      // console.log(updateDoc);
+
+      try {
+        let result;
+        if (data.condition === process.env.CONDITION) {
+          Reflect.deleteProperty(data, "condition");
+
+          result = await update_data(
+            filter,
+            updateDoc,
+            onsiteBookingCollection
+          );
+          // console.log("onsite");
+          // console.log(result);
+        } else {
+          result = await update_data(filter, updateDoc, bookingsCollection);
+        }
+
+        return res.send({
+          status: httpStatus.OK,
+          message: "Booking Successful",
+          data: result,
+        });
+      } catch (error) {
+        return res.send({
+          status: httpStatus.NOT_FOUND,
+          message: error?.message,
+        });
+      }
+    });
+
+    app.get("/api/v1/patient/mybooking", verifyJWT, async (req, res) => {
+      const email = req.decoded.email;
+
+      const isUserType = await usersCollection.findOne(
+        { email },
+        {
+          projection: {
+            role: 1,
+          },
+        }
+      );
+
+      if (isUserType?.role === "doctor") {
+        const result = await bookingsCollection
+          .find({ email, isBooked: true })
+          .toArray();
+        return res.send({
+          status: httpStatus.OK,
+          message: "Successfully Find the My Booking ",
+          data: result,
+        });
+      } else if (isUserType?.role === "admin") {
+        const result = await bookingsCollection.find({}).toArray();
+        return res.send({
+          status: httpStatus.OK,
+          message: "Successfully Find the My Booking ",
+          data: result,
+        });
+      } else {
+        const result = await bookingsCollection
+          .find({ patientEmail: email, isBooked: true })
+          .toArray();
+        return res.send({
+          status: httpStatus.OK,
+          message: "Successfully Find the My Booking ",
+          data: result,
+        });
+      }
+    });
+
+    app.get(
+      "/api/v1/prescription_doctor_history/:id",
+      verifyJWT,
+      verifyDoctor,
+      async (req, res) => {
+        const { id } = req.params;
+        const email = req.decoded.email;
+
+        const isDoctorsId = await bookingsCollection.findOne(
+          { _id: new ObjectId(id) },
+          { projection: { patientEmail: 1 } }
+        );
+
+        const patientInformation = await patientCollection.findOne({
+          email: isDoctorsId?.patientEmail,
+        });
+        if (!patientInformation) {
+          throw new Error("Something Went Wrong");
+        }
+        const doctorInformation = await doctorsCollection.findOne(
+          { email },
+          {
+            projection: {
+              password: 0,
+              email: 0,
+              registeredDoctor: 0,
+            },
+          }
+        );
+        if (!doctorInformation) {
+          throw new Error("Something went wrong");
+        }
+        res.send({
+          status: httpStatus.OK,
+          message: "Successfully Get",
+          data: {
+            patientInformation,
+            doctorInformation,
+          },
+        });
+      }
+    );
+
+    app.post(
+      "/api/v1/doctorprescription",
+      verifyJWT,
+      verifyDoctor,
+      async (req, res) => {
+        const email = req.decoded.email;
+        const createAt = new Date();
+        const data = req.body;
+        data.bookingId = new ObjectId(data.bookingId);
+
+        // started transaction roll back
+        const session = client.startSession();
+        try {
+          session.startTransaction();
+
+          const prescription = await prescriptionCollection.insertOne(
+            {
+              ...data,
+              email,
+              createAt,
+            },
+            { session }
+          );
+          if (!prescription) {
+            throw new Error("Prescription Session Issues");
+          }
+
+          const filter = {
+            _id: data.bookingId,
+          };
+
+          const updateDoc = {
+            $set: {
+              prescription: true,
+            },
+          };
+          const updateBooking = await bookingsCollection.updateOne(
+            filter,
+            updateDoc,
+            { upsert: true, session }
+          );
+          if (!updateBooking) {
+            throw new Error("Booking Session Issues");
+          }
+          await session.commitTransaction();
+          await session.endSession();
+          return res.send({
+            status: httpStatus.CREATED,
+            message: "Successfully  Prescription Recorded ",
+            data: prescription,
+          });
+        } catch (error) {
+          await session.abortTransaction();
+          await session.endSession();
+        }
+      }
+    );
+
+    app.get(
+      "/api/v1/find_the_prescription",
+      verifyJWT,
+
+      async (req, res) => {
+        const email = req.decoded.email;
+
+        const isExistType = await usersCollection.findOne(
+          { email },
+          {
+            projection: {
+              role: 1,
+            },
+          }
+        );
+        if (isExistType.role === "user") {
+          const result = await prescriptionCollection
+            .find({
+              patientemail: email,
+            })
+            .sort({ createAt: -1 })
+            .toArray();
+          return res.send({
+            status: httpStatus.OK,
+            message: "Successfully Get The My Prescription",
+            data: result,
+          });
+        } else {
+          const result = await prescriptionCollection
+            .find({
+              email,
+            })
+            .sort({ createAt: -1 })
+            .toArray();
+          return res.send({
+            status: httpStatus.OK,
+            message: "Successfully Get The My Prescription",
+            data: result,
+          });
+        }
+      }
+    );
+
+    app.post("/api/v1/review", verifyJWT, async (req, res) => {
+      const email = req.decoded.email;
+      const data = req.body;
+      data.doctorId = new ObjectId(data.doctorId);
+      data.appointmentId = new ObjectId(data.appointmentId);
+      data.createAt = new Date();
+      const filter = {
+        _id: data.doctorId,
+      };
+
+      const isExistReview = await reviewCollection.findOne({
+        appointmentId: data.appointmentId,
+      });
+
+      if (isExistReview) {
+        return res.send({
+          status: httpStatus.OK,
+          message: "This Doctor Review All Ready Exist",
+        });
+      }
+      const isDoctorExist = await doctorsCollection.findOne(filter, {
+        projection: {
+          email: 1,
+        },
+      });
+      post_data(reviewCollection, {
+        ...data,
+        email,
+        doctoremail: isDoctorExist?.email,
+      })
+        .then((result) => {
+          return res.send({
+            status: httpStatus.CREATED,
+            message: "Review Recorded Successfully",
+            data: result,
+          });
+        })
+        .catch((error) => {
+          return res.send({
+            status: httpStatus.NOT_FOUND,
+            message: error?.message,
+          });
+        });
+    });
+
+    app.get("/api/v1/all_my_review", verifyJWT, async (req, res) => {
+      const email = req.decoded.email;
+      const isUserTypes = await usersCollection.findOne(
+        { email },
+        { projection: { role: 1 } }
+      );
+
+      switch (isUserTypes.role) {
+        case "user":
+          {
+            const reviews = await reviewCollection.find({ email }).toArray();
+            res.send({
+              status: httpStatus.CREATED,
+              message: "Successfuly Get My Review",
+              data: reviews,
+            });
+          }
+          break;
+        case "doctor":
+          {
+            const averageRatingResult = await reviewCollection
+              .aggregate([
+                { $match: { doctoremail: email } },
+                {
+                  $group: {
+                    _id: "$doctoremail",
+                    averageRating: { $avg: "$rating" },
+                  },
+                },
+              ])
+              .toArray();
+            const reviews = await reviewCollection
+              .find({ doctoremail: email })
+              .toArray();
+
+            res.send({
+              status: httpStatus.CREATED,
+              message: "Successfuly Get My Review",
+              data: reviews,
+              avg: averageRatingResult,
+            });
+          }
+          break;
+        case "admin":
+          {
+            const reviews = await reviewCollection.find({}).toArray();
+            const avgRatings = await reviewCollection
+              .aggregate([
+                {
+                  $group: {
+                    _id: "$doctoremail",
+                    averageRating: { $avg: "$rating" },
+                  },
+                },
+              ])
+              .toArray();
+            res.send({
+              status: httpStatus.OK,
+              message: "Successfuly Get My Review",
+              data: reviews,
+              avg: avgRatings,
+            });
+          }
+          break;
+        default: {
+          console.log("defaulT");
+        }
+      }
+    });
+
+    app.delete("/api/v1/delete_review/:id", verifyJWT, async (req, res) => {
+      const { id } = req.params;
+      delete_data(id, reviewCollection)
+        .then((result) => {
+          return res.send({
+            status: httpStatus.OK,
+            message: "Successfully Delete Review",
+            data: result,
+          });
+        })
+        .catch((error) => {
+          return res.send({
+            status: httpStatus.NOT_FOUND,
+            message: error?.message,
+          });
+        });
+    });
+    app.get("/api/v1/my_profile_information", verifyJWT, async (req, res) => {
+      const email = req.decoded.email;
+
+      const result = await patientCollection.findOne(
+        { email },
+        {
+          projection: {
+            image: 1,
+            contactNumber: 1,
+
+            address: 1,
+          },
+        }
+      );
+      res.send({
+        status: httpStatus.OK,
+        message: "Successfully Get My Profile",
+        data: result,
+      });
+    });
+
+    app.put("/api/v1/updateUserProfile/:id", verifyJWT, async (req, res) => {
+      const { id } = req.params;
+      const data = req.body;
+      const filter = {
+        _id: new ObjectId(id),
+      };
+      const updateDoc = {
+        $set: {
+          address: data?.address,
+          contactNumber: data?.contactNumber,
+          image: data?.image,
+        },
+      };
+      update_data(filter, updateDoc, patientCollection)
+        .then((result) => {
+          return res.send({
+            status: httpStatus.OK,
+            message: "Successfully Update Profile",
+            data: result,
+          });
+        })
+        .catch((error) => {
+          return res.send({
+            status: httpStatus.NOT_FOUND,
+            message: error?.message,
+          });
+        });
+    });
+
+    app.get("/api/v1/common_dashboard", verifyJWT, async (req, res) => {
+      const email = req.decoded.email;
+      const isUserRole = await usersCollection.findOne(
+        { email },
+        { projection: { role: 1 } }
+      );
+      switch (isUserRole?.role) {
+        case "user":
+          {
+            const totalReviewCount = await reviewCollection.countDocuments({
+              email,
+            });
+            const totalPrescription =
+              await prescriptionCollection.countDocuments({
+                patientemail: email,
+              });
+            const totalPaymentInfo = await paymentsCollection
+              .find(
+                {
+                  patientEmail: email,
+                },
+                {
+                  projection: {
+                    _id: 1,
+                    price: 1,
+                    slot: 1,
+                    treatment: 1,
+                  },
+                }
+              )
+
+              .toArray();
+            res.send({
+              status: httpStatus.OK,
+              message: "Successfuy Get Patient Dashboard",
+              data: {
+                commonone: totalReviewCount,
+                commontwo: totalPrescription,
+                commonthree: totalPaymentInfo,
+              },
+            });
+          }
+          break;
+        case "doctor":
+          {
+            const totalReviewCount = await reviewCollection.countDocuments({
+              doctoremail: email,
+            });
+
+            const totalPrescription =
+              await prescriptionCollection.countDocuments({
+                email,
+              });
+
+            const totalPaymentInfo = await paymentsCollection
+              .find(
+                {
+                  email,
+                },
+                {
+                  projection: {
+                    _id: 1,
+                    price: 1,
+                    slot: 1,
+                    treatment: 1,
+                  },
+                }
+              )
+
+              .toArray();
+            res.send({
+              status: httpStatus.OK,
+              message: "Successfuy Get Patient Dashboard",
+              data: {
+                commonone: totalReviewCount,
+                commontwo: totalPrescription,
+                commonthree: totalPaymentInfo,
+              },
+            });
+          }
+          break;
+        case "admin":
+          {
+            const totalUserCount =
+              await usersCollection.estimatedDocumentCount();
+            const totalReviewCount =
+              await reviewCollection.estimatedDocumentCount();
+            const totalPrescriptionCount =
+              await prescriptionCollection.estimatedDocumentCount();
+            const totalPatientCount =
+              await patientCollection.estimatedDocumentCount();
+            const totalDoctorCount =
+              await doctorsCollection.estimatedDocumentCount();
+            const totalBookingCount =
+              await bookingsCollection.estimatedDocumentCount();
+            const totalAvailableCount =
+              await appointmentOptionCollection.estimatedDocumentCount();
+            const totalPaymentInfo = await paymentsCollection
+              .find(
+                {},
+                {
+                  projection: {
+                    _id: 1,
+                    price: 1,
+                    slot: 1,
+                    treatment: 1,
+                  },
+                }
+              )
+
+              .toArray();
+
+            res.send({
+              status: httpStatus.OK,
+              message: "Successfuy Get Patient Dashboard",
+              data: {
+                commonone: totalReviewCount,
+                commontwo: totalPrescriptionCount,
+                commonthree: totalPaymentInfo,
+                commonfour: totalPatientCount,
+                commonfive: totalUserCount,
+                commonsix: totalBookingCount,
+                commonseven: totalAvailableCount,
+                commoneight: totalDoctorCount,
+              },
+            });
+          }
+          break;
+
+        default: {
+          console.log("default information");
+        }
+      }
+    });
+
+    app.get(
+      "/api/v1/payment_transaction_report",
+      verifyJWT,
+      async (req, res) => {
+        const result = await paymentsCollection.find({}).toArray();
+
+        res.send({
+          status: httpStatus.OK,
+          message: "Successfully Get All Paymeny Report",
+          data: result,
+        });
+      }
+    );
+    app.get("/api/v1/update_patient_profile/:id", async (req, res) => {
+      const { id } = req.params;
+      const result = await patientCollection.findOne({ _id: new ObjectId(id) });
+      res.send({
+        status: httpStatus.OK,
+        message: "Successfully Get My Profile",
+        data: result,
+      });
+    });
+    app.put(
+      "/api/v1/update_patient_profile_info/:id",
+      verifyJWT,
+      async (req, res) => {
+        const { id } = req.params;
+        const data = req.body;
+        Reflect.deleteProperty(data, "_id");
+
+        const filter = {
+          _id: new ObjectId(id),
+        };
+        const updateDoc = {
+          $set: {
+            ...data,
+          },
+        };
+        update_data(filter, updateDoc, patientCollection)
+          .then((result) => {
+            return res.send({
+              status: httpStatus.OK,
+              message: "Successfully Update Patient Profile",
+              data: result,
+            });
+          })
+          .catch((error) => {
+            return res.send({
+              status: httpStatus.NOT_FOUND,
+              message: error?.message,
+            });
+          });
+      }
+    );
+
+    app.get("/patient/OnSitebookingSloat", verifyJWT, async (req, res) => {
+      const pipeline = [
+        {
+          $lookup: {
+            from: "onsitebookings", // the collection to join
+            localField: "_id", // field from doctorCollection
+            foreignField: "doctorId", // field from bookingCollection
+            as: "onsitebookings", // output array field
+          },
+        },
+
+        {
+          $project: {
+            name: 1,
+
+            specialty: 1,
+            experience: 1,
+            appointmentfee: 1,
+            image: 1,
+            district: 1,
+            onsitebookings: {
+              appointmentDate: 1,
+              treatment: 1,
+              patient: 1,
+              slot: 1,
+              price: 1,
+              status: 1,
+              doctorId: 1,
+              createdAt: 1,
+              isBooked: 1,
+
+              _id: 1,
+            },
+          },
+        },
+      ];
+      const mergedData = await doctorsCollection.aggregate(pipeline).toArray();
+      res.send(mergedData);
+    });
+
+    app.put("/api/v1/isOnsiteBookingSloat/:id", verifyJWT, async (req, res) => {
+      const email = req.decoded.email;
+      const { id } = req.params;
+      const data = req.body;
+
+      // checked is it patients Account
+      const isPatient = await usersCollection.findOne(
+        { email },
+        { projection: { role: 1 } }
+      );
+
+      if (
+        isPatient.role === process.env.USER_ROLE &&
+        isPatient.role === process.env.USER_ROLE_ADMIN
+      ) {
+        return res.send({
+          status: httpStatus.UNAUTHORIZED,
+          message: "Only Patient Can Be Booking",
+        });
+      }
+
+      const filter = {
+        _id: new ObjectId(id),
+      };
+      const updateDoc = {
+        $set: {
+          isBooked: data.isBooked,
+          patientEmail: email,
+          bookingTime: new Date(),
+        },
+      };
+
+      update_data(filter, updateDoc, onsiteBookingCollection)
+        .then((result) => {
+          return res.send({
+            status: httpStatus.OK,
+            message: "Booking Successfull",
+            data: result,
+          });
+        })
+        .catch((error) => {
+          return res.send({
+            status: httpStatus.NOT_FOUND,
+            message: error?.message,
+          });
+        });
+    });
+
+    app.get("/Onsitebookings", verifyJWT, async (req, res) => {
+      const email = req.query.email;
+      const decodedEmail = req.decoded.email;
+      // console.log(email);
+      // console.log(decodedEmail);
+
+      if (email !== decodedEmail) {
+        return res.status(403).send({ message: "forbidden access" });
+      }
+      //isBooked: true
+      const query = { email };
+      const bookings = await onsiteBookingCollection.find(query).toArray();
+
+      res.send({
+        status: httpStatus.OK,
+        message: "Successfully Get the Data",
+        data: bookings,
+      });
+    });
+    app.get("/api/v1/myonsite_appointment", verifyJWT, async (req, res) => {
+      const email = req.decoded.email;
+      try {
+        const result = await onsiteBookingCollection
+          .find({ patientEmail: email, isBooked: true })
+          .toArray();
+        res.send({
+          status: httpStatus.OK,
+          message: "Successfully Get the Data",
+          data: result,
+        });
+      } catch (error) {
+        res.send({
+          status: httpStatus.NOT_FOUND,
+          message: error?.message,
+        });
+      }
+    });
+
+    app.delete(`/api/v1/deleteAccount`, verifyJWT, async (req, res) => {
+      const email = req.decoded.email;
+      try {
+        const result = await usersCollection.deleteOne({ email });
+        res.send({
+          success: true,
+          status: httpStatus.OK,
+          message: "Successfully Delete Account",
+          data: result,
+        });
+      } catch (error) {
+        res.send({
+          status: httpStatus.FORBIDDEN,
+          message: error?.message,
+        });
+      }
+    });
   } finally {
   }
 }
